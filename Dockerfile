@@ -1,48 +1,43 @@
 FROM nvidia/cuda:12.1.1-devel-ubuntu22.04
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
-# 强制使用x86_64架构（避免arm64兼容问题）
-ENV TORCH_INSTALL_URL=https://download.pytorch.org/whl/cu121
-ENV PIP_DEFAULT_TIMEOUT=300
-# 双源兜底（阿里云+清华）
-ENV PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
-ENV PIP_EXTRA_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple/
-ENV PIP_TRUSTED_HOST=mirrors.aliyun.com,pypi.tuna.tsinghua.edu.cn
+ENV PATH=/venv/bin:$PATH
 
-# 1. 修复基础环境（核心：补全编译/依赖库）
+# 1. 安装基础依赖（最小集）
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.10 python3.10-dev python3.10-venv python3-pip \
-    build-essential gcc g++ libjpeg-dev zlib1g-dev git wget aria2 ffmpeg systemd systemd-sysv \
-    libssl-dev libffi-dev libgl1-mesa-glx libglib2.0-0 \
-    # 补全CUDA依赖（关键：匹配cu121）
-    libcudnn8 libcudnn8-dev \
+    build-essential gcc g++ wget git aria2 ffmpeg systemd systemd-sysv \
+    libssl-dev libffi-dev libgl1-mesa-glx libglib2.0-0 libcudnn8 libcudnn8-dev \
     && rm -rf /var/lib/apt/lists/* && \
-    # 统一python命令，避免版本混乱
     ln -sf /usr/bin/python3.10 /usr/bin/python && \
     ln -sf /usr/bin/pip3.10 /usr/bin/pip
 
-# 2. 创建venv并升级基础工具（避免pip版本过低）
+# 2. 创建venv并升级pip
 RUN python3.10 -m venv /venv && \
     /venv/bin/pip install --upgrade pip setuptools wheel --no-cache-dir
-ENV PATH=/venv/bin:$PATH
 
-# 3. 核心修复：手动指定CUDA版torch的whl包（绕过pip源解析问题）
-RUN pip install --no-cache-dir \
-    # 直接指定cu121的whl包（适配Python3.10+Linux x86_64）
-    torch==2.1.0+cu121 \
-    torchvision==0.16.0+cu121 \
-    torchaudio==2.1.0+cu121 \
-    # 强制从PyTorch官方源下载（优先级高于PyPI）
-    -f ${TORCH_INSTALL_URL}/torch_stable.html \
-    # 禁用PyPI源，仅用指定的torch源（避免源冲突）
-    --no-index
+# 3. 核心：手动下载torch/cu121的whl包（Python3.10+x86_64）
+RUN mkdir -p /tmp/torch_whl && cd /tmp/torch_whl && \
+    # 下载torch核心包（约2.4GB）
+    wget --no-check-certificate --timeout=600 --tries=3 \
+      https://download.pytorch.org/whl/cu121/torch-2.1.0%2Bcu121-cp310-cp310-linux_x86_64.whl && \
+    # 下载torchvision（约600MB）
+    wget --no-check-certificate --timeout=600 --tries=3 \
+      https://download.pytorch.org/whl/cu121/torchvision-0.16.0%2Bcu121-cp310-cp310-linux_x86_64.whl && \
+    # 下载torchaudio（约200MB）
+    wget --no-check-certificate --timeout=600 --tries=3 \
+      https://download.pytorch.org/whl/cu121/torchaudio-2.1.0%2Bcu121-cp310-cp310-linux_x86_64.whl && \
+    # 离线安装whl包（彻底避开pip源问题）
+    pip install --no-cache-dir *.whl && \
+    # 清理临时文件
+    rm -rf /tmp/torch_whl
 
-# 4. 验证torch+CUDA安装（提前失败，方便排查）
+# 4. 强制验证CUDA可用性（失败则终止构建）
 RUN python -c "import torch; \
-    print(f'Torch版本: {torch.__version__}'); \
-    print(f'CUDA可用: {torch.cuda.is_available()}'); \
-    print(f'CUDA版本: {torch.version.cuda}'); \
-    assert torch.cuda.is_available(), 'CUDA初始化失败！'"
+    assert torch.__version__ == '2.1.0+cu121', f'版本错误：{torch.__version__}'; \
+    assert torch.cuda.is_available(), 'CUDA不可用！'; \
+    assert torch.version.cuda == '12.1', f'CUDA版本错误：{torch.version.cuda}'; \
+    print('✅ Torch+CUDA安装成功！')"
 
 # 5. 部署ComfyUI及依赖
 RUN git clone https://github.com/comfyanonymous/ComfyUI.git /workspace/ComfyUI && \
@@ -59,21 +54,26 @@ RUN cd /workspace/ComfyUI/custom_nodes && \
     git clone https://github.com/Fanno/ComfyUI-Frame-Interpolation && \
     pip install --no-cache-dir face-alignment librosa opencv-python-headless
 
-# 7. 部署GPT-SoVITS（独立venv，复用torch安装逻辑）
+# 7. 部署GPT-SoVITS（复用离线whl逻辑）
 RUN git clone https://github.com/RVC-Boss/GPT-SoVITS.git /workspace/GPT-SoVITS && \
     python3.10 -m venv /workspace/GPT-SoVITS/venv && \
     /workspace/GPT-SoVITS/venv/bin/pip install --upgrade pip setuptools wheel --no-cache-dir && \
-    # 复用torch官方源安装，避免重复踩坑
-    /workspace/GPT-SoVITS/venv/bin/pip install --no-cache-dir \
-        torch==2.1.0+cu121 torchaudio==2.1.0+cu121 \
-        -f ${TORCH_INSTALL_URL}/torch_stable.html --no-index && \
+    # 给GPT-SoVITS的venv也装torch（离线方式）
+    mkdir -p /tmp/gpt_torch && cd /tmp/gpt_torch && \
+    wget --no-check-certificate --timeout=600 --tries=3 \
+      https://download.pytorch.org/whl/cu121/torch-2.1.0%2Bcu121-cp310-cp310-linux_x86_64.whl && \
+    wget --no-check-certificate --timeout=600 --tries=3 \
+      https://download.pytorch.org/whl/cu121/torchaudio-2.1.0%2Bcu121-cp310-cp310-linux_x86_64.whl && \
+    /workspace/GPT-SoVITS/venv/bin/pip install --no-cache-dir *.whl && \
+    rm -rf /tmp/gpt_torch && \
+    # 安装GPT-SoVITS依赖
     /workspace/GPT-SoVITS/venv/bin/pip install --no-cache-dir -r /workspace/GPT-SoVITS/requirements_infer.txt
 
 # 8. 配置systemd服务
 RUN echo '[Unit]\nDescription=ComfyUI\nAfter=network.target nvidia-persistenced.service\n[Service]\nType=simple\nUser=root\nGroup=root\nWorkingDirectory=/workspace/ComfyUI\nEnvironment="PATH=/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"\nEnvironment="PYTHONUNBUFFERED=1"\nExecStart=/venv/bin/python main.py --listen 0.0.0.0 --port 8188\nRestart=on-failure\nRestartSec=5s\nLimitNOFILE=65535\n[Install]\nWantedBy=multi-user.target' > /etc/systemd/system/comfyui.service && \
     systemctl enable comfyui
 
-# 9. 下载小权重文件（增加重试机制）
+# 9. 下载小权重文件（增加重试）
 RUN mkdir -p /workspace/ComfyUI/models/{ControlNet,loras,AnimateDiff,wav2lip,ipadapter} && \
     aria2c -x16 -c -s16 -k1M --timeout=600 --retry-wait=5 --max-tries=3 -o /workspace/ComfyUI/models/loras/anime-film.safetensors \
       https://huggingface.co/liujianpig/anime-film/resolve/main/anime-film.safetensors && \
