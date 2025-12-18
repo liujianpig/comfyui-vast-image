@@ -9,7 +9,11 @@ RUN apt-get update && apt-get install -y \
 
 RUN python3.10 -m venv /venv
 ENV PATH=/venv/bin:$PATH
-RUN pip install --upgrade pip torch==2.1.0+cu121 torchvision==0.16.0+cu121 -f https://download.pytorch.org/whl/torch_stable.html
+# 1. 确认用 python3.10 且先升级 pip
+RUN python3.10 -m pip install --upgrade pip
+# 2. 再装 torch/torchvision（分开写，避免并发编译）
+RUN python3.10 -m pip install torch==2.1.0+cu121 -f https://download.pytorch.org/whl/torch_stable.html
+RUN python3.10 -m pip install torchvision==0.16.0+cu121 -f https://download.pytorch.org/whl/torch_stable.html
 
 RUN git clone https://github.com/comfyanonymous/ComfyUI.git /workspace/ComfyUI
 RUN cd /workspace/ComfyUI && git clone https://github.com/ltdrdata/ComfyUI-Manager custom_nodes/ComfyUI-Manager
