@@ -1,61 +1,75 @@
 FROM nvidia/cuda:12.1.1-devel-ubuntu22.04
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
+ENV PIP_DEFAULT_TIMEOUT=100
+ENV PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
+ENV PIP_TRUSTED_HOST=mirrors.aliyun.com
 
-RUN apt-get update && apt-get install -y \
+# 1. 修复基础依赖（补充缺失的库，解决编译/运行报错）
+RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.10 python3.10-dev python3.10-venv python3-pip \
     build-essential libjpeg-dev zlib1g-dev git wget aria2 ffmpeg systemd systemd-sysv \
-    && rm -rf /var/lib/apt/lists/*
+    libssl-dev libffi-dev libgl1-mesa-glx libglib2.0-0 \  # 补充GUI/编译依赖
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3.10 /usr/bin/python  # 统一python命令
 
+# 2. 创建并激活全局venv（避免路径冲突）
 RUN python3.10 -m venv /venv
 ENV PATH=/venv/bin:$PATH
-# 1. 确认用 python3.10 且先升级 pip
-RUN python3.10 -m pip install --upgrade pip
-# 2. 再装 torch/torchvision（分开写，避免并发编译）
-RUN python3.10 -m pip install torch==2.1.0+cu121 -f https://download.pytorch.org/whl/torch_stable.html
-RUN python3.10 -m pip install torchvision==0.16.0+cu121 -f https://download.pytorch.org/whl/torch_stable.html
+RUN pip install --upgrade pip setuptools wheel  # 升级基础工具
 
-RUN git clone https://github.com/comfyanonymous/ComfyUI.git /workspace/ComfyUI
-RUN cd /workspace/ComfyUI && git clone https://github.com/ltdrdata/ComfyUI-Manager custom_nodes/ComfyUI-Manager
-RUN pip install -r /workspace/ComfyUI/requirements.txt einops transformers accelerate safetensors
+# 3. 安装PyTorch（指定cu121，国内源加速，避免编译失败）
+RUN pip install torch==2.1.0+cu121 torchvision==0.16.0+cu121 torchaudio==2.1.0+cu121 \
+    -f https://download.pytorch.org/whl/torch_stable.html \
+    --no-cache-dir
 
+# 4. 部署ComfyUI及依赖（分步安装，避免缓存爆炸）
+RUN git clone https://github.com/comfyanonymous/ComfyUI.git /workspace/ComfyUI \
+    && cd /workspace/ComfyUI \
+    && git clone https://github.com/ltdrdata/ComfyUI-Manager custom_nodes/ComfyUI-Manager \
+    && pip install --no-cache-dir -r requirements.txt einops transformers accelerate safetensors
+
+# 5. 安装ComfyUI自定义节点（补充依赖，避免运行报错）
 RUN cd /workspace/ComfyUI/custom_nodes && \
     git clone https://github.com/THUDM/ComfyUI-CogVideoX-I2V && \
     git clone https://github.com/aigem/ComfyUI-Wav2Lip-FP16 && \
     git clone https://github.com/cubiq/ComfyUI_IPAdapter_plus && \
     git clone https://github.com/Fanno/ComfyUI-Video-Multicrop && \
-    git clone https://github.com/Fanno/ComfyUI-Frame-Interpolation
+    git clone https://github.com/Fanno/ComfyUI-Frame-Interpolation && \
+    # 补充自定义节点依赖
+    pip install --no-cache-dir face-alignment librosa opencv-python-headless
 
-RUN git clone https://github.com/RVC-Boss/GPT-SoVITS.git /workspace/GPT-SoVITS
-RUN python3.10 -m venv /workspace/GPT-SoVITS/venv
-RUN /workspace/GPT-SoVITS/venv/bin/pip install --upgrade pip torch==2.1.0+cu121 torchaudio==2.1.0+cu121 -f https://download.pytorch.org/whl/torch_stable.html
-RUN /workspace/GPT-SoVITS/venv/bin/pip install -r /workspace/GPT-SoVITS/requirements_infer.txt
+# 6. 部署GPT-SoVITS（独立venv，避免依赖冲突）
+RUN git clone https://github.com/RVC-Boss/GPT-SoVITS.git /workspace/GPT-SoVITS \
+    && python3.10 -m venv /workspace/GPT-SoVITS/venv \
+    && /workspace/GPT-SoVITS/venv/bin/pip install --upgrade pip setuptools wheel \
+    && /workspace/GPT-SoVITS/venv/bin/pip install --no-cache-dir torch==2.1.0+cu121 torchaudio==2.1.0+cu121 \
+        -f https://download.pytorch.org/whl/torch_stable.html \
+    && /workspace/GPT-SoVITS/venv/bin/pip install --no-cache-dir -r /workspace/GPT-SoVITS/requirements_infer.txt
 
-RUN echo '[Unit]\nDescription=ComfyUI\nAfter=network.target\n[Service]\nType=simple\nUser=root\nWorkingDirectory=/workspace/ComfyUI\nEnvironment=PATH=/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\nExecStart=/venv/bin/python main.py --listen 0.0.0.0 --port 8188\nRestart=always\n[Install]\nWantedBy=multi-user.target' > /etc/systemd/system/comfyui.service
-RUN systemctl enable comfyui
-# ===== 大骨架同上（省略）=====
+# 7. 配置systemd服务（修复权限/路径问题）
+RUN echo '[Unit]\nDescription=ComfyUI\nAfter=network.target nvidia-persistenced.service\n[Service]\nType=simple\nUser=root\nGroup=root\nWorkingDirectory=/workspace/ComfyUI\nEnvironment="PATH=/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"\nEnvironment="PYTHONUNBUFFERED=1"\nExecStart=/venv/bin/python main.py --listen 0.0.0.0 --port 8188\nRestart=on-failure\nRestartSec=5s\nLimitNOFILE=65535\n[Install]\nWantedBy=multi-user.target' > /etc/systemd/system/comfyui.service \
+    && systemctl enable comfyui
 
-# 小权重（≤ 2 GB）直接装镜像
-RUN mkdir -p /workspace/ComfyUI/models/{ControlNet,loras,AnimateDiff,wav2lip,ipadapter}
+# 8. 下载小权重文件（添加超时重试，避免下载失败）
+RUN mkdir -p /workspace/ComfyUI/models/{ControlNet,loras,AnimateDiff,wav2lip,ipadapter} \
+    # ① 动漫LoRA
+    && aria2c -x16 -c -s16 -k1M --timeout=600 --retry-wait=5 -o /workspace/ComfyUI/models/loras/anime-film.safetensors \
+      https://huggingface.co/liujianpig/anime-film/resolve/main/anime-film.safetensors \
+    && aria2c -x16 -c -s16 -k1M --timeout=600 --retry-wait=5 -o /workspace/ComfyUI/models/loras/flat-color.safetensors \
+      https://huggingface.co/liujianpig/flat-color/resolve/main/flat-color.safetensors \
+    # ② AnimateDiff运动模块
+    && aria2c -x16 -c -s16 -k1M --timeout=600 --retry-wait=5 -o /workspace/ComfyUI/models/AnimateDiff/mm-Stabilized-FPF-v2.ckpt \
+      https://huggingface.co/guoyww/animatediff/resolve/main/mm-Stabilized-FPF-v2.ckpt \
+    # ③ ControlNet动漫线稿
+    && aria2c -x16 -c -s16 -k1M --timeout=600 --retry-wait=5 -o /workspace/ComfyUI/models/ControlNet/control_v11p_sd15_lineart.pth \
+      https://huggingface.co/lllyasviel/ControlNet-v1-1/resolve/main/control_v11p_sd15_lineart.pth \
+    # ④ IP-Adapter + Wav2Lip
+    && aria2c -x16 -c -s16 -k1M --timeout=600 --retry-wait=5 -o /workspace/ComfyUI/models/ipadapter/ip-adapter_sd15.safetensors \
+      https://huggingface.co/h94/IP-Adapter/resolve/main/models/ip-adapter_sd15.safetensors \
+    && aria2c -x16 -c -s16 -k1M --timeout=600 --retry-wait=5 -o /workspace/ComfyUI/models/wav2lip/wav2lip_gfpkerfp16.pth \
+      https://huggingface.co/aigem/wav2lip-fp16/resolve/main/wav2lip_gfpkerfp16.pth
 
-# ① 动漫常用 LoRA（≤ 200 MB × 5）
-RUN aria2c -x16 -c -o /workspace/ComfyUI/models/loras/anime-film.safetensors \
-  https://huggingface.co/liujianpig/anime-film/resolve/main/anime-film.safetensors
-RUN aria2c -x16 -c -o /workspace/ComfyUI/models/loras/flat-color.safetensors \
-  https://huggingface.co/liujianpig/flat-color/resolve/main/flat-color.safetensors
-
-# ② AnimateDiff-SD1.5 运动模块（1.6 GB）
-RUN aria2c -x16 -c -o /workspace/ComfyUI/models/AnimateDiff/mm-Stabilized-FPF-v2.ckpt \
-  https://huggingface.co/guoyww/animatediff/resolve/main/mm-Stabilized-FPF-v2.ckpt
-
-# ③ ControlNet 动漫线稿（1.4 GB）
-RUN aria2c -x16 -c -o /workspace/ComfyUI/models/ControlNet/control_v11p_sd15_lineart.pth \
-  https://huggingface.co/lllyasviel/ControlNet-v1-1/resolve/main/control_v11p_sd15_lineart.pth
-
-# ④ IP-Adapter + Wav2Lip（< 1 GB）
-RUN aria2c -x16 -c -o /workspace/ComfyUI/models/ipadapter/ip-adapter_sd15.safetensors \
-  https://huggingface.co/h94/IP-Adapter/resolve/main/models/ip-adapter_sd15.safetensors
-RUN aria2c -x16 -c -o /workspace/ComfyUI/models/wav2lip/wav2lip_gfpkerfp16.pth \
-  https://huggingface.co/aigem/wav2lip-fp16/resolve/main/wav2lip_gfpkerfp16.pth
+# 9. 暴露端口 + 启动命令（修复systemd运行问题）
 EXPOSE 8188 8080 1111
-CMD ["/bin/bash"]
+CMD ["/bin/bash", "-c", "systemctl daemon-reload && systemctl start comfyui && tail -f /var/log/syslog"]
