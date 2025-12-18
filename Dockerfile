@@ -62,13 +62,14 @@ RUN cd /workspace/ComfyUI/custom_nodes && \
     # 安装50系显卡专属优化库
     pip install --no-cache-dir nvidia-cudnn-cu12==9.1.0.70 --upgrade
 
-# 7. 部署GPT-SoVITS（独立venv，适配50系）
+# 7. 部署GPT-SoVITS（独立venv，适配50系）【核心修正：统一RUN指令，补全&&】
 RUN git clone https://github.com/RVC-Boss/GPT-SoVITS.git /workspace/GPT-SoVITS && \
     python3.10 -m venv /workspace/GPT-SoVITS/venv && \
     /workspace/GPT-SoVITS/venv/bin/pip install --upgrade pip setuptools wheel --no-cache-dir && \
-    # 复用本地whl包安装torch 2.4.0
-    COPY ./torch_whl/torch-2.4.0+cu124-cp310-cp310-linux_x86_64.whl /tmp/gpt_torch/
-    COPY ./torch_whl/torchaudio-2.4.0+cu124-cp310-cp310-linux_x86_64.whl /tmp/gpt_torch/
+    # 复用本地whl包安装torch 2.4.0（修正：COPY后用&&连接，且合并到同一个RUN）
+    mkdir -p /tmp/gpt_torch && \
+    cp /tmp/torch_whl/torch-2.4.0+cu124-cp310-cp310-linux_x86_64.whl /tmp/gpt_torch/ && \
+    cp /tmp/torch_whl/torchaudio-2.4.0+cu124-cp310-cp310-linux_x86_64.whl /tmp/gpt_torch/ && \
     /workspace/GPT-SoVITS/venv/bin/pip install --no-cache-dir /tmp/gpt_torch/*.whl && \
     rm -rf /tmp/gpt_torch && \
     # 安装GPT-SoVITS依赖，适配50系显卡
