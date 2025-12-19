@@ -1,5 +1,5 @@
-# 匹配50系显卡：CUDA 12.4.1 + Ubuntu22.04（驱动由宿主机提供，无需容器内装）
-FROM nvidia/cuda:12.4.1-devel-ubuntu22.04
+# 极简基础镜像：CUDA 12.4.1 + Ubuntu22.04（仅保留核心CUDA运行时）
+FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 ENV PATH=/venv/bin:$PATH
@@ -8,20 +8,17 @@ ENV TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0"
 # 优化显存调度
 ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-# 1. 修复apt源 + 安装基础依赖（移除容器内显卡驱动）
-RUN apt-get update && \
-    # 添加NVIDIA官方源（解决libcudnn9找不到的问题）
-    apt-key adv --fetch-keys https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/3bf863cc.pub && \
-    echo "deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/ /" > /etc/apt/sources.list.d/cuda.list && \
-    echo "deb https://developer.download.nvidia.com/compute/machine-learning/repos/ubuntu2204/x86_64/ /" > /etc/apt/sources.list.d/nvidia-ml.list && \
-    apt-get update && \
-    # 安装依赖（移除nvidia-driver/nvidia-settings，容器内无需装驱动）
-    apt-get install -y --no-install-recommends \
+# 1. 仅安装Ubuntu基础依赖（无NVIDIA APT包）
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # 核心Python环境
     python3.10 python3.10-dev python3.10-venv python3-pip \
-    build-essential gcc g++ git aria2 ffmpeg systemd systemd-sysv \
+    # 编译工具
+    build-essential gcc g++ \
+    # 基础工具
+    git aria2 ffmpeg systemd systemd-sysv \
+    # 系统依赖
     libssl-dev libffi-dev libgl1-mesa-glx libglib2.0-0 \
-    # 用CUDA源安装libcudnn9（适配12.4）
-    libcudnn9-cuda-12 libcudnn9-dev-cuda-12 \
+    # 清理缓存
     && rm -rf /var/lib/apt/lists/* && \
     # 统一Python/pip命令
     ln -sf /usr/bin/python3.10 /usr/bin/python && \
@@ -31,59 +28,72 @@ RUN apt-get update && \
 RUN python3.10 -m venv /venv && \
     /venv/bin/pip install --upgrade pip setuptools wheel --no-cache-dir
 
-# 3. 离线安装PyTorch 2.4.0 + CUDA 12.4（50系显卡最优版本）
+# 3. 离线安装PyTorch 2.4.0 + CUDA 12.4（本地COPY，无网络依赖）
 COPY ./torch_whl/*.whl /tmp/torch_whl/
 RUN mkdir -p /tmp/torch_whl && \
     pip install --no-cache-dir /tmp/torch_whl/*.whl && \
+    # 离线安装cuDNN（绕过APT，用PyPI包）
+    pip install --no-cache-dir nvidia-cudnn-cu12==9.1.0.70 && \
+    # 配置cuDNN路径
+    export CUDNN_INCLUDE_DIR=/venv/lib/python3.10/site-packages/nvidia/cudnn/include && \
+    export CUDNN_LIB_DIR=/venv/lib/python3.10/site-packages/nvidia/cudnn/lib64 && \
+    ldconfig && \
+    # 清理临时文件
     rm -rf /tmp/torch_whl
 
-# 4. 验证50系显卡适配（强制校验算力）
+# 4. 验证50系显卡适配（强制校验）
 RUN python -c "import torch; \
-    assert torch.__version__ == '2.4.0+cu124', f'版本错误：{torch.__version__}'; \
-    assert torch.cuda.is_available(), 'CUDA不可用！'; \
+    # 基础验证
+    assert torch.__version__ == '2.4.0+cu124', f'Torch版本错误：{torch.__version__}'; \
+    assert torch.cuda.is_available(), 'CUDA不可用（宿主机驱动/--gpus参数问题）'; \
     assert torch.version.cuda == '12.4', f'CUDA版本错误：{torch.version.cuda}'; \
-    # 验证50系显卡算力（SM_90）
-    assert '9.0' in str(torch.cuda.get_device_capability(0)), f'算力不匹配：{torch.cuda.get_device_capability(0)}'; \
+    # 50系显卡算力验证（SM_90）
+    capability = torch.cuda.get_device_capability(0); \
+    assert capability[0] == 9 and capability[1] == 0, f'算力不匹配：{capability}（需RTX 5070/5090）'; \
+    # cuDNN验证
+    assert torch.backends.cudnn.version() == '9100', f'cuDNN版本错误：{torch.backends.cudnn.version()}'; \
+    # 输出成功信息
     print(f'✅ 显卡型号：{torch.cuda.get_device_name(0)}'); \
-    print(f'✅ 算力版本：{torch.cuda.get_device_capability(0)}'); \
-    print('✅ RTX 5070/5090 适配成功！')"
+    print(f'✅ 算力版本：{capability}'); \
+    print(f'✅ CUDA版本：{torch.version.cuda}'); \
+    print(f'✅ cuDNN版本：{torch.backends.cudnn.version()}'); \
+    print('✅ RTX 5070/5090 全量适配成功！')"
 
-# 5. 部署ComfyUI及依赖（优化显存占用）
+# 5. 部署ComfyUI及依赖（优化显存）
 RUN git clone https://github.com/comfyanonymous/ComfyUI.git /workspace/ComfyUI && \
     cd /workspace/ComfyUI && \
     git clone https://github.com/ltdrdata/ComfyUI-Manager custom_nodes/ComfyUI-Manager && \
     # 适配50系显卡，强制升级依赖
     pip install --no-cache-dir -r requirements.txt einops transformers accelerate safetensors --upgrade && \
-    # 安装显存优化插件
-    pip install --no-cache-dir xformers==0.0.27.post2 --upgrade
+    # 安装显存优化插件（50系专属）
+    pip install --no-cache-dir xformers==0.0.27.post2 triton==2.4.0 --upgrade
 
-# 6. 安装ComfyUI自定义节点+50系适配
+# 6. 安装ComfyUI自定义节点
 RUN cd /workspace/ComfyUI/custom_nodes && \
     git clone https://github.com/THUDM/ComfyUI-CogVideoX-I2V && \
     git clone https://github.com/aigem/ComfyUI-Wav2Lip-FP16 && \
     git clone https://github.com/cubiq/ComfyUI_IPAdapter_plus && \
     git clone https://github.com/Fanno/ComfyUI-Video-Multicrop && \
     git clone https://github.com/Fanno/ComfyUI-Frame-Interpolation && \
-    # 补充节点依赖，适配50系显卡
-    pip install --no-cache-dir face-alignment librosa opencv-python-headless --upgrade && \
-    # 安装50系显卡专属优化库
-    pip install --no-cache-dir nvidia-cudnn-cu12==9.1.0.70 --upgrade
+    # 补充节点依赖
+    pip install --no-cache-dir face-alignment librosa opencv-python-headless --upgrade
 
-# 7. 部署GPT-SoVITS（独立venv，适配50系）
+# 7. 部署GPT-SoVITS（独立venv）
 RUN git clone https://github.com/RVC-Boss/GPT-SoVITS.git /workspace/GPT-SoVITS && \
     python3.10 -m venv /workspace/GPT-SoVITS/venv && \
     /workspace/GPT-SoVITS/venv/bin/pip install --upgrade pip setuptools wheel --no-cache-dir && \
-    # 复用已下载的whl包
+    # 复用torch whl包（提前下载到本地）
     mkdir -p /tmp/gpt_torch && \
     cp /tmp/torch_whl/torch-2.4.0+cu124-cp310-cp310-linux_x86_64.whl /tmp/gpt_torch/ && \
     cp /tmp/torch_whl/torchaudio-2.4.0+cu124-cp310-cp310-linux_x86_64.whl /tmp/gpt_torch/ && \
-    /workspace/GPT-SoVITS/venv/bin/pip install --no-cache-dir /tmp/gpt_torch/*.whl && \
+    # 安装torch+cuDNN
+    /workspace/GPT-SoVITS/venv/bin/pip install --no-cache-dir /tmp/gpt_torch/*.whl nvidia-cudnn-cu12==9.1.0.70 && \
     rm -rf /tmp/gpt_torch && \
-    # 安装GPT-SoVITS依赖，适配50系显卡
+    # 安装GPT-SoVITS依赖
     /workspace/GPT-SoVITS/venv/bin/pip install --no-cache-dir -r /workspace/GPT-SoVITS/requirements_infer.txt --upgrade
 
-# 8. 配置systemd服务（优化50系显卡显存）
-RUN echo '[Unit]\nDescription=ComfyUI (RTX 5070/5090)\nAfter=network.target nvidia-persistenced.service\n[Service]\nType=simple\nUser=root\nGroup=root\nWorkingDirectory=/workspace/ComfyUI\nEnvironment="PATH=/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"\nEnvironment="PYTHONUNBUFFERED=1"\nEnvironment="TORCH_CUDA_ARCH_LIST=8.0;8.6;8.9;9.0"\nEnvironment="PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"\nExecStart=/venv/bin/python main.py --listen 0.0.0.0 --port 8188 --cuda-malloc-backend cudaMallocAsync\nRestart=on-failure\nRestartSec=5s\nLimitNOFILE=65535\nLimitMEMLOCK=infinity\n[Install]\nWantedBy=multi-user.target' > /etc/systemd/system/comfyui.service && \
+# 8. 配置systemd服务（50系显存优化）
+RUN echo '[Unit]\nDescription=ComfyUI (RTX 5070/5090)\nAfter=network.target\n[Service]\nType=simple\nUser=root\nGroup=root\nWorkingDirectory=/workspace/ComfyUI\nEnvironment="PATH=/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"\nEnvironment="PYTHONUNBUFFERED=1"\nEnvironment="TORCH_CUDA_ARCH_LIST=8.0;8.6;8.9;9.0"\nEnvironment="PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"\nExecStart=/venv/bin/python main.py --listen 0.0.0.0 --port 8188 --cuda-malloc-backend cudaMallocAsync\nRestart=on-failure\nRestartSec=5s\nLimitNOFILE=65535\nLimitMEMLOCK=infinity\n[Install]\nWantedBy=multi-user.target' > /etc/systemd/system/comfyui.service && \
     systemctl enable comfyui
 
 # 9. 下载小权重文件（增加重试）
