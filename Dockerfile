@@ -1,4 +1,4 @@
-# 匹配50系显卡：CUDA 12.4.1 + Ubuntu22.04（驱动≥550）
+# 匹配50系显卡：CUDA 12.4.1 + Ubuntu22.04（驱动由宿主机提供，无需容器内装）
 FROM nvidia/cuda:12.4.1-devel-ubuntu22.04
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
@@ -8,13 +8,20 @@ ENV TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0"
 # 优化显存调度
 ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-# 1. 安装基础依赖（适配50系显卡）
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# 1. 修复apt源 + 安装基础依赖（移除容器内显卡驱动）
+RUN apt-get update && \
+    # 添加NVIDIA官方源（解决libcudnn9找不到的问题）
+    apt-key adv --fetch-keys https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/3bf863cc.pub && \
+    echo "deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/ /" > /etc/apt/sources.list.d/cuda.list && \
+    echo "deb https://developer.download.nvidia.com/compute/machine-learning/repos/ubuntu2204/x86_64/ /" > /etc/apt/sources.list.d/nvidia-ml.list && \
+    apt-get update && \
+    # 安装依赖（移除nvidia-driver/nvidia-settings，容器内无需装驱动）
+    apt-get install -y --no-install-recommends \
     python3.10 python3.10-dev python3.10-venv python3-pip \
     build-essential gcc g++ git aria2 ffmpeg systemd systemd-sysv \
-    libssl-dev libffi-dev libgl1-mesa-glx libglib2.0-0 libcudnn9 libcudnn9-dev \
-    # 补充50系显卡必需的NVIDIA驱动依赖
-    nvidia-driver-550 nvidia-settings \
+    libssl-dev libffi-dev libgl1-mesa-glx libglib2.0-0 \
+    # 用CUDA源安装libcudnn9（适配12.4）
+    libcudnn9-cuda-12 libcudnn9-dev-cuda-12 \
     && rm -rf /var/lib/apt/lists/* && \
     # 统一Python/pip命令
     ln -sf /usr/bin/python3.10 /usr/bin/python && \
@@ -36,7 +43,7 @@ RUN python -c "import torch; \
     assert torch.cuda.is_available(), 'CUDA不可用！'; \
     assert torch.version.cuda == '12.4', f'CUDA版本错误：{torch.version.cuda}'; \
     # 验证50系显卡算力（SM_90）
-    assert '9.0' in torch.cuda.get_device_capability(0), f'算力不匹配：{torch.cuda.get_device_capability(0)}'; \
+    assert '9.0' in str(torch.cuda.get_device_capability(0)), f'算力不匹配：{torch.cuda.get_device_capability(0)}'; \
     print(f'✅ 显卡型号：{torch.cuda.get_device_name(0)}'); \
     print(f'✅ 算力版本：{torch.cuda.get_device_capability(0)}'); \
     print('✅ RTX 5070/5090 适配成功！')"
@@ -62,11 +69,11 @@ RUN cd /workspace/ComfyUI/custom_nodes && \
     # 安装50系显卡专属优化库
     pip install --no-cache-dir nvidia-cudnn-cu12==9.1.0.70 --upgrade
 
-# 7. 部署GPT-SoVITS（独立venv，适配50系）【核心修正：统一RUN指令，补全&&】
+# 7. 部署GPT-SoVITS（独立venv，适配50系）
 RUN git clone https://github.com/RVC-Boss/GPT-SoVITS.git /workspace/GPT-SoVITS && \
     python3.10 -m venv /workspace/GPT-SoVITS/venv && \
     /workspace/GPT-SoVITS/venv/bin/pip install --upgrade pip setuptools wheel --no-cache-dir && \
-    # 复用本地whl包安装torch 2.4.0（修正：COPY后用&&连接，且合并到同一个RUN）
+    # 复用已下载的whl包
     mkdir -p /tmp/gpt_torch && \
     cp /tmp/torch_whl/torch-2.4.0+cu124-cp310-cp310-linux_x86_64.whl /tmp/gpt_torch/ && \
     cp /tmp/torch_whl/torchaudio-2.4.0+cu124-cp310-cp310-linux_x86_64.whl /tmp/gpt_torch/ && \
